@@ -24,6 +24,12 @@ n_head = 6
 n_embd = 384
 dropout = 0.2
 
+# attention configuration
+attention_type = 'vanilla'  # options: 'vanilla', 'linformer', 'performer', 'nystrom'
+attention_config = {
+    'linformer_k': 64,  # projection dimension for linformer, default to block_size//4
+}
+
 learning_rate = 1e-3 # with baby networks can afford to go a bit higher
 max_iters = 5000
 lr_decay_iters = 5000 # make equal to max_iters usually

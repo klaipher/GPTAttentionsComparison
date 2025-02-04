@@ -7,6 +7,8 @@ python data/shakespeare_char/prepare.py
 
 ```bash
 python train.py config/train_shakespeare_char.py
+
+python train.py config/train_shakespeare_char.py --attention_type=linformer
 ```
 
 ```bash
