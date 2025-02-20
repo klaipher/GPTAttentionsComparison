@@ -25,6 +25,10 @@ class NystromAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        
+        # mask
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                             .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
@@ -44,7 +48,7 @@ class NystromAttention(nn.Module):
         # Compute the attention matrix
         L = F.softmax(torch.matmul(q, k_landmarks.transpose(-1, -2)), dim=-1)
         P = self.__iterative_inv(F.softmax(torch.matmul(q_landmarks, k_landmarks.transpose(-1, -2)), dim=-1))
-        N = F.softmax(torch.matmul(q_landmarks, k.transpose(-1, -2)) - 1e9 * (1 - mask[:, None, None, :]), dim=-1)
+        N = F.softmax(torch.matmul(q_landmarks, k.transpose(-1, -2)).masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf')), dim=-1)
         
         # Compute attention scores
         att = L @ P @ N
