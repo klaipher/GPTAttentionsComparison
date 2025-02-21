@@ -11,9 +11,11 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+from torch.nn import functional
 
 from attention.nystrom import NystromAttention
+from attention.linformer import LinformerAttention
+from attention.vanilla import VanillaAttention
 
 
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
@@ -34,124 +36,24 @@ class LayerNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
     def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
-
-
-class LinformerAttention(nn.Module):
-    """
-    Linformer self-attention mechanism with linear complexity.
-    Projects keys and values to a lower dimensional space for efficiency.
-    """
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        
-        # Default Linformer config
-        self.linformer_k = config.attention_config.get('linformer_k', config.block_size // 4) if config.attention_config else config.block_size // 4
-        
-        # key, query, value projections for all heads
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        
-        # Linformer projection matrices
-        self.E = nn.Parameter(torch.randn(config.n_head, self.linformer_k, config.block_size))
-        self.F = nn.Parameter(torch.randn(config.n_head, self.linformer_k, config.block_size))
-        
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-
-    def forward(self, x):
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-
-        # Project keys and values to lower dimensional space
-        k_projected = torch.matmul(self.E[:, :, :T], k)  # (B, nh, k, hs)
-        v_projected = torch.matmul(self.F[:, :, :T], v)  # (B, nh, k, hs)
-
-        # Compute attention scores
-        att = (q @ k_projected.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        
-        # Apply attention to values and reshape
-        y = att @ v_projected  # (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
+        return functional.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
 class CausalSelfAttention(nn.Module):
-
     def __init__(self, config):
         super().__init__()
-        if config.attention_type == 'linformer':
+        attention_type = config.attention_type.lower()
+        if attention_type == 'linformer':
             self.attention = LinformerAttention(config)
-        elif config.attention_type == 'performer':
-            raise NotImplementedError("Performer attention not implemented yet")
-        elif config.attention_type == 'nystrom':
+        elif attention_type == 'nystrom':
             self.attention = NystromAttention(config)
-        else:  # vanilla attention
-            assert config.n_embd % config.n_head == 0
-            # key, query, value projections for all heads, but in a batch
-            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-            # output projection
-            self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-            # regularization
-            self.attn_dropout = nn.Dropout(config.dropout)
-            self.resid_dropout = nn.Dropout(config.dropout)
-            self.n_head = config.n_head
-            self.n_embd = config.n_embd
-            self.dropout = config.dropout
-            # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-            self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-            if not self.flash:
-                print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-                # causal mask to ensure that attention is only applied to the left in the input sequence
-                self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                     .view(1, 1, config.block_size, config.block_size))
+        elif attention_type == 'vanilla':
+            self.attention = VanillaAttention(config)
+        else:
+            raise ValueError(f"Unknown attention type: {attention_type}")
 
     def forward(self, x):
-        if hasattr(self, 'attention'):
-            return self.attention(x)
-            
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None,
-                                                                 dropout_p=self.dropout if self.training else 0,
-                                                                 is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
+        return self.attention(x)
 
 
 class MLP(nn.Module):
@@ -267,7 +169,7 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
@@ -315,8 +217,7 @@ class GPT(nn.Module):
                     # weights of blacklist modules will NOT be weight decayed
                     no_decay.add(fpn)
                 elif pn in ['E', 'F']:  # Linformer projection matrices
-                    # Add Linformer projection matrices to decay set
-                    decay.add(fpn)
+                    no_decay.add(fpn)
 
         # subtle: 'transformer.wte.weight' and 'lm_head.weight' are tied, so they
         # will appear in the no_decay and decay sets respectively after the above.
@@ -383,7 +284,7 @@ class GPT(nn.Module):
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
+            probs = functional.softmax(logits, dim=-1)
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
