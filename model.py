@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from attention.nystrom import NystromAttention
+
 
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
@@ -99,7 +101,7 @@ class CausalSelfAttention(nn.Module):
         elif config.attention_type == 'performer':
             raise NotImplementedError("Performer attention not implemented yet")
         elif config.attention_type == 'nystrom':
-            raise NotImplementedError("Nystrom attention not implemented yet")
+            self.attention = NystromAttention(config)
         else:  # vanilla attention
             assert config.n_embd % config.n_head == 0
             # key, query, value projections for all heads, but in a batch

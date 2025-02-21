@@ -1,5 +1,8 @@
+import math
+
 import torch
 import torch.nn as nn
+from networkx import k_edge_augmentation
 from torch.nn import functional as F
 
 class NystromAttention(nn.Module):
@@ -32,23 +35,31 @@ class NystromAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+        hs = C // self.n_head
 
         # calculate query, key, values for all heads in batch
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+        k = k.view(B, T, self.n_head, hs).transpose(1, 2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, hs).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, hs).transpose(1, 2)  # (B, nh, T, hs)
         
-        params = {'B': B, 'nh': self.n_head, 'T': T, 'hs': C // self.n_head}
+        params = {'B': B, 'nh': self.n_head, 'T': T, 'hs': hs}
         
         # Project keys and values to lower dimensional space
         q_landmarks = self.__get_landmark_representation(q, self.n_landmarks, **params)
         k_landmarks = self.__get_landmark_representation(k, self.n_landmarks, **params)
         
         # Compute the attention matrix
-        L = F.softmax(torch.matmul(q, k_landmarks.transpose(-1, -2)), dim=-1)
-        P = self.__iterative_inv(F.softmax(torch.matmul(q_landmarks, k_landmarks.transpose(-1, -2)), dim=-1))
-        N = F.softmax(torch.matmul(q_landmarks, k.transpose(-1, -2)).masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf')), dim=-1)
+        L = F.softmax(q @ k_landmarks.transpose(-1, -2) / math.sqrt(hs), dim=-1)
+        P = self.__iterative_inv(F.softmax(q_landmarks @ k_landmarks.transpose(-1, -2) / math.sqrt(hs), dim=-1))
+
+        N_prod = (q_landmarks @ k.transpose(-1, -2))
+        # print(N_prod.shape)
+        # print(self.bias.shape)
+        # print(q_landmarks.shape)
+        N_masked = N_prod.masked_fill(self.bias[:, :, :self.n_landmarks, :T] == 0, float('-inf'))
+        N = F.softmax(N_masked / math.sqrt(hs), dim=-1)
         
         # Compute attention scores
         att = L @ P @ N
@@ -63,7 +74,7 @@ class NystromAttention(nn.Module):
         return y
     
     def __get_landmark_representation(self, tensor, num_landmarks, B, nh, T, hs):
-        tensor_reshaped = tensor.reshape(B, nh, num_landmarks, T // num_landmarks, hs).transpose(1, 2) # (B, nh, T, hs)
+        tensor_reshaped = tensor.reshape(-1, nh, num_landmarks, T // num_landmarks, hs) # (B, nh, T, hs)
         tensor_landmarks = tensor_reshaped.mean(dim=-2)
         return tensor_landmarks
 
