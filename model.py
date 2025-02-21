@@ -15,7 +15,7 @@ from torch.nn import functional
 
 from attention.nystrom import NystromAttention
 from attention.linformer import LinformerAttention
-from attention.performer import PerformerAttention
+from attention.performer import CausalPerformerAttention
 from attention.vanilla import VanillaAttention
 
 
@@ -51,7 +51,7 @@ class CausalSelfAttention(nn.Module):
         elif attention_type == 'vanilla':
             self.attention = VanillaAttention(config)
         elif attention_type == 'performer':
-            self.attention = PerformerAttention(config)
+            self.attention = CausalPerformerAttention(config)
         else:
             raise ValueError(f"Unknown attention type: {attention_type}")
 

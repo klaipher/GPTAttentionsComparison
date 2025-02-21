@@ -3,7 +3,18 @@ import torch
 import torch.nn as nn
 
 
-class PerformerAttention(nn.Module):
+class CausalPerformerAttention(nn.Module):
+    """
+    Causal Performer attention (FAVOR+) for GPT-style models.
+    Uses random feature maps + prefix sums to enforce autoregressive masking.
+
+    NOTE:
+    - This is a *vectorized* implementation. For long T,
+      memory consumption can be high (we store prefix sums of shape ~ (B, n_head, T, ...)).
+    - If you need incremental generation, you would maintain prefix sums
+      in a stateful manner instead of computing them for the entire sequence at once.
+    """
+
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -17,98 +28,106 @@ class PerformerAttention(nn.Module):
         self.n_features = config.attention_config.get('performer_features', 64) \
             if config.attention_config else 64
 
-        # Q, K, V projections
+        # Q, K, V projections (linear)
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # Output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
-        # Regularization
+        # Dropouts
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
-        # Random projection matrix for the feature map
-        # Typically not trained, so we register it as a buffer
-        # Shape: (head_size, n_features)
-        # We'll scale it by 1 / (some_std) for stable exponent magnitudes
+        # Create a random projection matrix for the feature map
+        # Typically, it is not trained; we register it as a buffer
+        # shape = (head_size, n_features)
+        # scaled by e.g. 0.01 or 0.1 to keep exponent magnitudes stable
         proj = torch.randn(self.head_size, self.n_features) * 0.1
         self.register_buffer("proj", proj)
 
     def forward(self, x):
+        """
+        x: (B, T, C), where C = n_embd
+        returns: (B, T, C)
+        """
         B, T, C = x.size()
 
-        # 1) Compute Q, K, V
-        qkv = self.c_attn(x)  # (B, T, 3C)
-        q, k, v = qkv.split(C, dim=2)  # each (B, T, C)
+        # 1) Compute Q, K, V in one fused linear op
+        qkv = self.c_attn(x)  # (B, T, 3*C)
+        q, k, v = qkv.split(C, dim=2)  # each is (B, T, C)
 
-        # 2) Split heads: (B, n_head, T, head_size)
+        # 2) Reshape into heads: (B, n_head, T, head_size)
         q = q.view(B, T, self.n_head, self.head_size).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_size).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_size).transpose(1, 2)
 
-        # 3) Map Q, K with the Performer random feature map
-        #    We'll do a simple Gaussian random features approach:
-        #    phi(x) = exp( x @ proj - ||x||^2/2 ) (with normalization)
-        #    For numerical stability, we usually add an epsilon as well.
-        q_prime = self._prime(q)  # (B, n_head, T, n_features)
+        # 3) Map K, Q via the Performer random feature map: phi(k), phi(q)
         k_prime = self._prime(k)  # (B, n_head, T, n_features)
+        q_prime = self._prime(q)  # (B, n_head, T, n_features)
 
-        # 4) Approximate "softmax(QK^T) V" with:
-        #    out = (q_prime * (k_prime^T V)) / (q_prime * k_prime^T 1)
-        #    We'll implement that in steps:
+        # 4) Compute prefix sums for enforcing causality.
+        #    We'll do cumulative sums along time dimension, so each position t
+        #    sees only sum_{<=t} instead of sum_{<=T}.
 
-        # 4a) Compute K'^T V by merging the T dimension in K'^T
-        #    k_prime: (B, n_head, T, n_features)
-        #    v:       (B, n_head, T, head_size)
-        # We want (B, n_head, n_features, head_size)
-        # i.e. sum_{t} [k_prime(t) * v(t)]
-        kv_ = torch.einsum('b h t f, b h t d -> b h f d', k_prime, v)  # (B, n_head, n_features, head_size)
+        # 4a) Compute k_prime * v => shape (B, n_head, T, n_features, head_size)
+        #    We'll do an unsqueeze on the last dimension of k_prime or v
+        #    to match them up.
+        k_prime_expanded = k_prime.unsqueeze(-1)  # (B, n_head, T, n_features, 1)
+        v_expanded = v.unsqueeze(-2)  # (B, n_head, T, 1, head_size)
+        kprime_v = k_prime_expanded * v_expanded  # (B, n_head, T, n_features, head_size)
 
-        # 4b) Compute normalizing denominator = q_prime * sum_{t}(k_prime(t))
-        #    which is  (B, n_head, T, n_features) x (B, n_head, n_features) -> (B, n_head, T)
-        # But we first sum over T in k_prime => shape (B, n_head, n_features)
-        k_sum = k_prime.sum(dim=2)  # (B, n_head, n_features)
-        # Then multiply by q_prime => (B, n_head, T)
-        denom = torch.einsum('b h t f, b h f -> b h t', q_prime, k_sum)  # (B, n_head, T)
-        denom = 1.0 / (denom + 1e-6)  # avoid division by zero
+        # 4b) prefix sums along T
+        prefix_k = torch.cumsum(k_prime, dim=2)  # (B, n_head, T, n_features)
+        prefix_kprime_v = torch.cumsum(kprime_v, dim=2)  # (B, n_head, T, n_features, head_size)
 
-        # 4c) Now compute the numerator: q_prime @ (k_prime^T V)
-        # q_prime: (B, n_head, T, n_features)
-        # kv_:     (B, n_head, n_features, head_size)
-        out = torch.einsum('b h t f, b h f d -> b h t d', q_prime, kv_)  # (B, n_head, T, head_size)
+        # 5) For each position t, the attention result is:
+        #    numerator[t]   = q_prime[t] dot prefix_kprime_v[t]
+        #    denominator[t] = q_prime[t] dot prefix_k[t]
+        #    out[t] = numerator[t] / denominator[t]
 
-        # 4d) Multiply by denom as broadcast: (B, n_head, T, head_size)
-        out = out * denom.unsqueeze(-1)
+        # We'll do that in a fully vectorized manner with einsum:
+        # numerator shape => (B, n_head, T, head_size)
+        numerator = torch.einsum(
+            'b n t f, b n t f d -> b n t d',  # q_prime[t,f] * prefix_kprime_v[t,f,d] -> out[t,d]
+            q_prime,
+            prefix_kprime_v
+        )
+        # denominator shape => (B, n_head, T)
+        denominator = torch.einsum(
+            'b n t f, b n t f -> b n t',  # q_prime[t,f] * prefix_k[t,f] -> scalar
+            q_prime,
+            prefix_k
+        ) + 1e-6  # avoid division by zero
 
+        out = numerator / denominator.unsqueeze(-1)  # broadcast over 'd'
+
+        # 6) Optional: dropout on the attention output
         out = self.attn_dropout(out)
 
-        # 5) Re-combine heads
+        # 7) Re-combine the heads: (B, T, C)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
 
-        # 6) Final linear + residual dropout
+        # 8) Final linear projection + residual dropout
         out = self.resid_dropout(self.c_proj(out))
         return out
 
     def _prime(self, x):
         """
         Performer random feature map:
-          phi(x) = exp( x @ proj - ||x||^2 / 2 )
-        with shape transformations.
+           phi(x) = exp(x * W - ||x||^2 / 2) / sqrt(n_features)
+        where W is self.proj (shape [head_size, n_features]).
 
-        x: (B, n_head, T, head_size)
+        x: shape (B, n_head, T, head_size)
         returns: (B, n_head, T, n_features)
         """
-        # 1) squared norm
-        # ||x||^2 along the last dim: shape (B, n_head, T, 1)
-        norm_sq = torch.sum(x ** 2, dim=-1, keepdim=True)  # (B, n_head, T, 1)
+        # squared norm of x => (B, n_head, T, 1)
+        norm_sq = torch.sum(x ** 2, dim=-1, keepdim=True)  # ||x||^2
 
-        # 2) project x => (B, n_head, T, n_features)
-        #    self.proj has shape (head_size, n_features)
-        x_proj = torch.einsum('b h t d, d f -> b h t f', x, self.proj)
+        # x_proj => (B, n_head, T, n_features)
+        x_proj = torch.einsum('b n t d, d f -> b n t f', x, self.proj)
 
-        # 3) exponent
-        # We do: exp(x_proj - norm_sq/2)
-        # This is the approximate kernel for softmax
+        # exponent => exp(x_proj - norm_sq/2)
         x_exp = torch.exp(x_proj - 0.5 * norm_sq)
 
-        # 4) normalization factor: typically 1/sqrt(n_features), or we can do it later
+        # scale by 1 / sqrt(n_features)
         x_exp = x_exp * (1.0 / math.sqrt(self.n_features))
         return x_exp
