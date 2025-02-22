@@ -21,11 +21,12 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
-
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+import matplotlib.pyplot as plt
+from collections import defaultdict
 
 from model import GPTConfig, GPT
 
@@ -238,6 +239,71 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+# Add metrics tracking
+class MetricsTracker:
+    def __init__(self):
+        self.metrics = defaultdict(list)
+        self.step_times = []
+        
+    def update(self, metrics_dict, step_time=None):
+        for k, v in metrics_dict.items():
+            self.metrics[k].append(v)
+        if step_time is not None:
+            self.step_times.append(step_time)
+            
+    def get_latest(self, metric_name):
+        return self.metrics[metric_name][-1] if self.metrics[metric_name] else None
+        
+    def plot_metrics(self, save_dir):
+        # Create metrics directory if it doesn't exist
+        metrics_dir = os.path.join(save_dir, 'metrics')
+        os.makedirs(metrics_dir, exist_ok=True)
+        
+        # Plot loss
+        plt.figure(figsize=(10, 5))
+        plt.plot(self.metrics['train_loss'], label='Train Loss')
+        plt.plot(self.metrics['val_loss'], label='Val Loss')
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss')
+        plt.title(f'Loss vs Iteration (Attention: {attention_type})')
+        plt.legend()
+        plt.savefig(os.path.join(metrics_dir, 'loss.png'))
+        plt.close()
+        
+        # Plot memory usage
+        plt.figure(figsize=(10, 5))
+        plt.plot(self.metrics['mem_allocated'], label='Allocated Memory (GB)')
+        plt.plot(self.metrics['mem_reserved'], label='Reserved Memory (GB)')
+        plt.xlabel('Iteration')
+        plt.ylabel('Memory (GB)')
+        plt.title(f'Memory Usage vs Iteration (Attention: {attention_type})')
+        plt.legend()
+        plt.savefig(os.path.join(metrics_dir, 'memory.png'))
+        plt.close()
+        
+        # Plot throughput (tokens/sec)
+        plt.figure(figsize=(10, 5))
+        plt.plot(self.metrics['throughput'], label='Tokens/sec')
+        plt.xlabel('Iteration')
+        plt.ylabel('Tokens/second')
+        plt.title(f'Throughput vs Iteration (Attention: {attention_type})')
+        plt.legend()
+        plt.savefig(os.path.join(metrics_dir, 'throughput.png'))
+        plt.close()
+        
+        # Save raw metrics data
+        metrics_data = {
+            'metrics': dict(self.metrics),
+            'step_times': self.step_times,
+            'attention_type': attention_type,
+            'model_config': model_args
+        }
+        with open(os.path.join(metrics_dir, 'metrics.pkl'), 'wb') as f:
+            pickle.dump(metrics_data, f)
+
+# Initialize metrics tracker
+metrics_tracker = MetricsTracker()
+
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
@@ -271,6 +337,15 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        
+        # Update metrics
+        metrics_tracker.update({
+            'train_loss': losses['train'],
+            'val_loss': losses['val'],
+            'lr': lr,
+            'mfu': running_mfu*100,
+        })
+        
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -289,52 +364,65 @@ while True:
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
+                    'metrics': metrics_tracker.metrics,  # Save metrics history
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                
+                # Generate and save metric plots
+                metrics_tracker.plot_metrics(out_dir)
+                
     if iter_num == 0 and eval_only:
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
+    t_forward_start = time.time()
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            loss = loss / gradient_accumulation_steps
         X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
-    # clip the gradient
+    
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
+    
     if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+        # Calculate throughput
+        tokens_per_sec = tokens_per_iter / dt
+        
+        # Get memory stats
+        allocated_mem, reserved_mem = get_memory_stats()
+        
+        # Update metrics
+        metrics_tracker.update({
+            'throughput': tokens_per_sec,
+            'mem_allocated': allocated_mem,
+            'mem_reserved': reserved_mem,
+            'step_time': dt
+        })
+        
+        # get loss as float
         lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        allocated_mem, reserved_mem = get_memory_stats()
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, "
-              f"{device_type.upper()} mem allocated={allocated_mem:.2f}GB, reserved={reserved_mem:.2f}GB")
+              f"{device_type.upper()} mem allocated={allocated_mem:.2f}GB, reserved={reserved_mem:.2f}GB, "
+              f"throughput={tokens_per_sec:.2f} tokens/sec")
+    
     iter_num += 1
     local_iter_num += 1
 
