@@ -393,8 +393,8 @@ while True:
                     for i, block in enumerate(raw_model.transformer.h):
                         if hasattr(block.attn, 'attention') and isinstance(block.attn.attention, LinformerAttention):
                             linformer_attn = block.attn.attention
-                            E_matrices[f'block_{i}'] = linformer_attn.E.detach().cpu().numpy()
-                            F_matrices[f'block_{i}'] = linformer_attn.F.detach().cpu().numpy()
+                            E_matrices[f'block_{i}'] = linformer_attn.E.detach().cpu()
+                            F_matrices[f'block_{i}'] = linformer_attn.F.detach().cpu()
 
                     # Save the matrices as separate pickle files with the desired naming convention
                     with open(os.path.join(out_dir, 'linformer_E_256.pkl'), 'wb') as f:
