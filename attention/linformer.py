@@ -11,8 +11,7 @@ class LinformerAttention(nn.Module):
 
         self.n_head = config.n_head
         self.head_size = config.n_embd // config.n_head
-        self.linformer_k = config.attention_config.get('linformer_k', config.block_size // 4) \
-            if config.attention_config else config.block_size // 4
+        self.linformer_k = 128
 
         # Q, K, V projections
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
