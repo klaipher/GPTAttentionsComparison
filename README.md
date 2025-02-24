@@ -25,7 +25,7 @@ This repository contains experiments comparing different attention mechanisms in
   - Cosine similarity between the approximated and exact (Transformer) attention matrices.
 
 - **Notebook Purpose:**  
-  The provided Jupyter Notebook (`attention_matrices_comparison.ipynb`) is used for aggregating, analyzing, and visualizing these metrics. It helps you compare the efficiency and approximation quality of the different attention mechanisms.
+  The provided Jupyter Notebook (`attention-is-all-you-need.ipynb`) is used for aggregating, analyzing, and visualizing these metrics. It helps you compare the efficiency and approximation quality of the different attention mechanisms.
 
 ## Repository Structure
 
@@ -38,6 +38,9 @@ This repository contains experiments comparing different attention mechanisms in
 - **data/shakespeare_char/**  
   Contains the script to prepare the Shakespeare character-level dataset.
 
+- **data/attention-is-all-you-need.ipynb**  
+  A Jupyter Notebook for processing and visualizing metrics such as running time, memory usage, and cosine similarity across different attention methods.
+  
 - **model.py**  
   Defines the Transformer model (nanoGPT) which uses the selected attention mechanism.
 
@@ -50,8 +53,6 @@ This repository contains experiments comparing different attention mechanisms in
 - **attention/**  
   Contains the implementations of various attention mechanisms (including both fully vectorized and stateful versions of Performer attention).
 
-- **attention_matrices_comparison.ipynb**  
-  A Jupyter Notebook for processing and visualizing metrics such as running time, memory usage, and cosine similarity across different attention methods.
 
 ## Installation
 
