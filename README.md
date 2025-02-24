@@ -1,7 +1,3 @@
-Below is an updated version of the README file that includes a simple note indicating that the repository contains nanoGPT and explains the purpose of the notebook:
-
----
-
 # GPT Attentions Comparison
 
 This repository contains experiments comparing different attention mechanisms in Transformer-based models. We have implemented various attention methods—including the classic Transformer (vanilla), Linformer, Nystromformer, and Performer—and integrated them into a miniature GPT model (nanoGPT, ~12M parameters). The nanoGPT model is used to train on the complete works of Shakespeare, demonstrating that our custom-built attention modules are fully compatible with transformer architectures.
@@ -83,6 +79,6 @@ python train.py config/train_shakespeare_char.py --max_iters=1500 --block_size=5
 ```
 
 ### Metrics and Analysis
-Open `attention_matrices_comparison.ipynb` to:
+Open `attention-is-all-you-need.ipynb` to:
 - Aggregate and analyze metrics (running time, memory, similarity).
 - Visualize performance comparisons between the different attention methods.
