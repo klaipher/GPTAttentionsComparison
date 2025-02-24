@@ -38,9 +38,6 @@ class CausalPerformerAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
 
         # Create a random projection matrix for the feature map
-        # Typically, it is not trained; we register it as a buffer
-        # shape = (head_size, n_features)
-        # scaled by e.g. 0.01 or 0.1 to keep exponent magnitudes stable
         proj = torch.randn(self.head_size, self.n_features) * 0.1
         self.register_buffer("proj", proj)
 
@@ -51,62 +48,50 @@ class CausalPerformerAttention(nn.Module):
         """
         B, T, C = x.size()
 
-        # 1) Compute Q, K, V in one fused linear op
-        qkv = self.c_attn(x)  # (B, T, 3*C)
-        q, k, v = qkv.split(C, dim=2)  # each is (B, T, C)
-
-        # 2) Reshape into heads: (B, n_head, T, head_size)
+        # Compute Q, K, V in one fused linear op
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(C, dim=2) 
+        
+        # Reshape into heads: (B, n_head, T, head_size)
         q = q.view(B, T, self.n_head, self.head_size).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_size).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_size).transpose(1, 2)
 
-        # 3) Map K, Q via the Performer random feature map: phi(k), phi(q)
+        # Map K, Q via the Performer random feature map: phi(k), phi(q)
         k_prime = self._prime(k)  # (B, n_head, T, n_features)
         q_prime = self._prime(q)  # (B, n_head, T, n_features)
 
-        # 4) Compute prefix sums for enforcing causality.
-        #    We'll do cumulative sums along time dimension, so each position t
-        #    sees only sum_{<=t} instead of sum_{<=T}.
+        # Compute prefix sums for enforcing causality.
+        k_prime_expanded = k_prime.unsqueeze(-1)
+        v_expanded = v.unsqueeze(-2)
+        # Compute k_prime * v => shape (B, n_head, T, n_features, head_size)
+        kprime_v = k_prime_expanded * v_expanded 
 
-        # 4a) Compute k_prime * v => shape (B, n_head, T, n_features, head_size)
-        #    We'll do an unsqueeze on the last dimension of k_prime or v
-        #    to match them up.
-        k_prime_expanded = k_prime.unsqueeze(-1)  # (B, n_head, T, n_features, 1)
-        v_expanded = v.unsqueeze(-2)  # (B, n_head, T, 1, head_size)
-        kprime_v = k_prime_expanded * v_expanded  # (B, n_head, T, n_features, head_size)
+        # prefix sums along T
+        prefix_k = torch.cumsum(k_prime, dim=2)
+        prefix_kprime_v = torch.cumsum(kprime_v, dim=2)
 
-        # 4b) prefix sums along T
-        prefix_k = torch.cumsum(k_prime, dim=2)  # (B, n_head, T, n_features)
-        prefix_kprime_v = torch.cumsum(kprime_v, dim=2)  # (B, n_head, T, n_features, head_size)
-
-        # 5) For each position t, the attention result is:
-        #    numerator[t]   = q_prime[t] dot prefix_kprime_v[t]
-        #    denominator[t] = q_prime[t] dot prefix_k[t]
-        #    out[t] = numerator[t] / denominator[t]
-
-        # We'll do that in a fully vectorized manner with einsum:
-        # numerator shape => (B, n_head, T, head_size)
         numerator = torch.einsum(
-            'b n t f, b n t f d -> b n t d',  # q_prime[t,f] * prefix_kprime_v[t,f,d] -> out[t,d]
+            'b n t f, b n t f d -> b n t d', 
             q_prime,
             prefix_kprime_v
         )
         # denominator shape => (B, n_head, T)
         denominator = torch.einsum(
-            'b n t f, b n t f -> b n t',  # q_prime[t,f] * prefix_k[t,f] -> scalar
+            'b n t f, b n t f -> b n t',  
             q_prime,
             prefix_k
         ) + 1e-6  # avoid division by zero
 
         out = numerator / denominator.unsqueeze(-1)  # broadcast over 'd'
 
-        # 6) Optional: dropout on the attention output
+        # Dropout on the attention output
         out = self.attn_dropout(out)
 
-        # 7) Re-combine the heads: (B, T, C)
+        # Re-combine the heads: (B, T, C)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
 
-        # 8) Final linear projection + residual dropout
+        # Final linear projection + residual dropout
         out = self.resid_dropout(self.c_proj(out))
         return out
 
