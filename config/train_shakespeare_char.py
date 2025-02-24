@@ -27,7 +27,7 @@ dropout = 0.2
 # attention configuration
 attention_type = 'vanilla'  # options: 'vanilla', 'linformer', 'performer', 'nystrom'
 attention_config = {
-    'linformer_k': 64,  # projection dimension for linformer, default to block_size//4
+    'linformer_k': 128,  # projection dimension for linformer, default to block_size//4
     'nystrom_landmarks': 64
 }
 
