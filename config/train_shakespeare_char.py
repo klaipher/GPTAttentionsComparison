@@ -16,7 +16,7 @@ wandb_run_name = 'mini-gpt'
 dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1
 batch_size = 32
-block_size = 256  # context of up to 256 previous characters
+block_size = 1024  # context of up to 256 previous characters
 
 # baby GPT model :)
 n_layer = 6
@@ -27,7 +27,7 @@ dropout = 0.2
 # attention configuration
 attention_type = 'vanilla'  # options: 'vanilla', 'linformer', 'performer', 'nystrom'
 attention_config = {
-    'linformer_k': 256,  # projection dimension for linformer, default to block_size//4
+    'linformer_k': 128,  # projection dimension for linformer, default to block_size//4
     'nystrom_landmarks': 64
 }
 

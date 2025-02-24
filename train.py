@@ -397,12 +397,14 @@ while True:
                             F_matrices[f'block_{i}'] = linformer_attn.F.detach().cpu()
 
                     # Save the matrices as separate pickle files with the desired naming convention
-                    with open(os.path.join(out_dir, f'linformer_E_{raw_model.config.block_size}.pkl'), 'wb') as f:
+                    file_name_e_matrix = f'linformer_E_{raw_model.config.block_size}_{raw_model.config.attention_config["linformer_k"]}.pkl'
+                    file_name_f_matrix = f'linformer_F_{raw_model.config.block_size}_{raw_model.config.attention_config["linformer_k"]}.pkl'
+                    with open(os.path.join(out_dir, file_name_e_matrix), 'wb') as f:
                         pickle.dump(E_matrices, f)
-                    with open(os.path.join(out_dir, f'linformer_F_{raw_model.config.block_size}.pkl'), 'wb') as f:
+                    with open(os.path.join(out_dir, file_name_f_matrix), 'wb') as f:
                         pickle.dump(F_matrices, f)
 
-                    print(f"Saved Linformer matrices to 'linformer_E_{raw_model.config.block_size}.pkl' and 'linformer_F_{raw_model.config.block_size}.pkl'")
+                    print(f"Saved Linformer matrices to '{file_name_e_matrix}' and '{file_name_f_matrix}'")
 
                 # Generate and save metric plots
                 metrics_tracker.plot_metrics(out_dir)
